@@ -1,6 +1,5 @@
 const c = @cImport({
-    @cInclude("linux/if_ether.h");
-    @cInclude("linux/if_arp.h");
+    @cInclude("netinet/if_ether.h");
 });
 
 const std = @import("std");
@@ -8,25 +7,41 @@ const mem = std.mem;
 const assert = std.debug.assert;
 const print = std.debug.print;
 
-const EthernetHeaderPtr = @import("./ethernet.zig").EthernetHeaderPtr;
+const ethernet = @import("./ethernet.zig");
+const EthernetPDU = ethernet.EthernetPDU;
+const EthernetHeaderPtr = ethernet.EthernetHeaderPtr;
+const replyEthernet = ethernet.replyEthernet;
+
 const TunDevice = @import("./tuntap.zig").TunDevice;
 
-pub const ArpHeaderPtr = struct {
-    data: *[Size]u8,
+const util = @import("./util.zig");
+const DevAddress = util.DevAddress;
 
-    // hardware_type      - 2 bytes
-    // protype            - 2 bytes
-    // hardware_addr_size - 1 byte
-    // prosize            - 1 byte
-    // opcode             - 2 bytes
+const SendBuf = @import("./buf.zig").SendBuf;
+
+pub const ArpPDU = struct {
+    prev: EthernetPDU,
+    header: ArpHeaderPtr,
+    sdu: []u8,
+};
+
+pub const ArpHeaderPtr = struct {
+    data: *[header_size]u8,
+
+    // hardware_type      - 16 bits
+    // protype            - 16 bits
+    // hardware_addr_size - 8 bits
+    // prosize            - 8 bits
+    // opcode             - 16 bits
     //                      -------
+    //                      64 bits
     //                      8 bytes
-    pub const Size = 8;
+    pub const header_size = 8;
     const Self = @This();
 
     pub fn cast(buf: []u8) Self {
-        assert(buf.len >= Size);
-        return Self{ .data = buf[0..Size] };
+        assert(buf.len >= header_size);
+        return Self{ .data = buf[0..header_size] };
     }
 
     pub fn hardware_type(self: Self) u16 {
@@ -69,7 +84,7 @@ pub const ArpHeaderPtr = struct {
         mem.writeIntBig(u16, self.data[6..8], val);
     }
 
-    pub fn as_bytes(self: Self) *const [Size]u8 {
+    pub fn as_bytes(self: Self) *const [header_size]u8 {
         return self.data;
     }
 
@@ -99,21 +114,22 @@ pub const ArpHeaderPtr = struct {
     }
 };
 
-const ArpIpv4Ptr = packed struct {
-    data: *[Size]u8,
+pub const ArpIpv4Ptr = packed struct {
+    data: *[data_size]u8,
 
-    // sender_mac      - 6 bytes
-    // sender_ip       - 4 bytes
-    // destination_mac - 6 bytes
-    // destination_ip  - 4 bytes
+    // sender_mac      - 48 bits
+    // sender_ip       - 32 bits
+    // destination_mac - 48 bits
+    // destination_ip  - 32 bits
     //                   -------
+    //                   160 bits
     //                   20 bytes
-    const Size = 20;
+    pub const data_size = 20;
     const Self = @This();
 
     pub fn cast(buf: []u8) Self {
-        assert(buf.len >= Size);
-        return Self{ .data = buf[0..Size] };
+        assert(buf.len >= data_size);
+        return Self{ .data = buf[0..data_size] };
     }
 
     pub fn sender_mac(self: Self) u48 {
@@ -148,7 +164,7 @@ const ArpIpv4Ptr = packed struct {
         mem.writeIntBig(u32, self.data[16..20], val);
     }
 
-    pub fn as_bytes(self: Self) *const [Size]u8 {
+    pub fn as_bytes(self: Self) *const [data_size]u8 {
         return self.data;
     }
 
@@ -182,7 +198,8 @@ const ArpIpv4Ptr = packed struct {
 //     FrameNotForUs,
 // };
 
-pub fn handle_arp(iface: *TunDevice, ip: u32, mac: u48, data: []u8) !void {
+pub fn handleARP(iface: *TunDevice, addr: DevAddress, prev: EthernetPDU) !void {
+    const data = prev.sdu;
     print("handling arp\n", .{});
     var arp_hdr = ArpHeaderPtr.cast(data);
 
@@ -196,44 +213,57 @@ pub fn handle_arp(iface: *TunDevice, ip: u32, mac: u48, data: []u8) !void {
         return error.UnexpectedProtocol;
     }
 
-    var arp_ipv4 = ArpIpv4Ptr.cast(data[ArpHeaderPtr.Size..]);
+    const pdu = ArpPDU{
+        .prev = prev,
+        .header = arp_hdr,
+        .sdu = data[ArpHeaderPtr.header_size..],
+    };
+
+    return handleARPIP(iface, addr, pdu);
+}
+
+pub fn handleARPIP(iface: *TunDevice, addr: DevAddress, prev: ArpPDU) !void {
+    const data = prev.sdu;
+    var arp_ipv4 = ArpIpv4Ptr.cast(data);
 
     const dest_ip = arp_ipv4.destination_ip();
     // TODO: Update translation table
-    if (ip != dest_ip) return error.FrameNotForUs;
+    if (addr.ip != dest_ip) return error.FrameNotForUs;
 
-    switch (arp_hdr.opcode()) {
+    switch (prev.header.opcode()) {
         c.ARPOP_REQUEST => {
-            const pkt_size = EthernetHeaderPtr.Size + ArpHeaderPtr.Size + ArpIpv4Ptr.Size;
-            var buf = [_]u8{0} ** pkt_size;
+            const pkt_size = EthernetHeaderPtr.Size + ArpHeaderPtr.header_size + ArpIpv4Ptr.data_size;
+            // We know in advance that what the maximum size of the packet is
+            // going to be. If for some reason, however, it happens
+            var buf = std.heap.stackFallback(pkt_size, std.heap.c_allocator);
+            var send_buf = SendBuf.init(buf.get());
 
-            var rest: []u8 = &buf;
-            EthernetHeaderPtr.cast(rest).set(.{
-                .dest_mac = arp_ipv4.sender_mac(),
-                .src_mac = mac,
-                .ethertype = c.ETH_P_ARP,
-            });
-            rest = rest[EthernetHeaderPtr.Size..];
-            ArpHeaderPtr.cast(rest).set(.{
-                .hardware_type = c.ARPHRD_ETHER,
-                .protype = c.ETH_P_IP,
-                .hardware_addr_size = 6,
-                .prosize = 4,
-                .opcode = c.ARPOP_REPLY,
-            });
-            rest = rest[ArpHeaderPtr.Size..];
-            ArpIpv4Ptr.cast(rest).set(.{
-                .sender_mac = mac,
-                .sender_ip = ip,
+            var slot = try send_buf.allocSlot(ArpIpv4Ptr.data_size);
+            ArpIpv4Ptr.cast(slot).set(.{
+                .sender_mac = addr.mac,
+                .sender_ip = addr.ip,
                 .destination_mac = arp_ipv4.sender_mac(),
                 .destination_ip = arp_ipv4.sender_ip(),
             });
 
-            try iface.writer().writeAll(&buf);
+            return replyARP(iface, addr, prev, &send_buf);
         },
         else => {
             print("Not an arp request\n", .{});
             return;
         },
     }
+}
+
+pub fn replyARP(iface: *TunDevice, addr: DevAddress, req_pdu: ArpPDU, buf: *SendBuf) !void {
+    var slot = try buf.allocSlot(ArpHeaderPtr.header_size);
+    ArpHeaderPtr.cast(slot).set(.{
+        .hardware_type = c.ARPHRD_ETHER,
+        .protype = c.ETH_P_IP,
+        .hardware_addr_size = 6,
+        .prosize = 4,
+        .opcode = c.ARPOP_REPLY,
+    });
+
+    return replyEthernet(iface, addr, req_pdu.prev, buf);
 }

@@ -1,22 +1,38 @@
+const c = @cImport(@cInclude("netinet/ether.h"));
+
 const std = @import("std");
 const mem = std.mem;
 const builtin = @import("builtin");
 const native_endian = builtin.target.cpu.arch.endian();
 const assert = std.debug.assert;
 
+const handleARP = @import("./arp.zig").handleARP;
+const handleIP = @import("./ip.zig").handleIP;
+
+const TunDevice = @import("./tuntap.zig").TunDevice;
+
+const SendBuf = @import("./buf.zig").SendBuf;
+
 const util = @import("./util.zig");
+const DevAddress = util.DevAddress;
 const sliceWriter = util.sliceWriter;
 const networkToHost = util.networkToHost;
 const hostToNetwork = util.hostToNetwork;
 
+pub const EthernetPDU = struct {
+    header: EthernetHeaderPtr,
+    sdu: []u8,
+};
+
 pub const EthernetHeaderPtr = struct {
     data: *[Size]u8,
 
-    // destination MAC address - 6 bytes
-    // source MAC address      - 6 bytes
-    // ethernet type           - 2 bytes
-    //                           -------
-    //                           14 bytes
+    // dest_mac  - 48 bits
+    // src_mac   - 48 bits
+    // ethertype - 16 bits
+    //             -------
+    //             112 bits
+    //             14 bytes
     pub const Size = 14;
     const Self = @This();
 
@@ -74,19 +90,43 @@ pub const EthernetHeaderPtr = struct {
     }
 };
 
-pub fn mac_addr_to_str(mac: u48) [18:0]u8 {
-    var s: [18:0]u8 = undefined;
+pub const EthernetProtocol = enum(u16) {
+    Ip = c.ETH_P_IP,
+    Arp = c.ETH_P_ARP,
+};
 
-    var slice: []u8 = &s;
-    var writer = sliceWriter(&slice);
+pub fn handleEthernet(iface: *TunDevice, addr: DevAddress, prev: []u8) !void {
+    const data = prev;
+    var ether_hdr = EthernetHeaderPtr.cast(data);
+    const pdu = EthernetPDU{
+        .header = ether_hdr,
+        .sdu = data[EthernetHeaderPtr.Size..],
+    };
+    const ethertype = ether_hdr.ethertype();
+    if (ethertype != c.ETH_P_ARP and ethertype != c.ETH_P_IP) return;
 
-    var mac_bytes = @ptrCast(*const [6]u8, &mac);
-    for (mac_bytes) |byte, i| {
-        // The buffer should have enough space to fit the whole thing
-        if (i > 0) writer.print(":", .{}) catch unreachable;
-        writer.print("{x:0<2}", .{byte}) catch unreachable;
+    switch (ethertype) {
+        c.ETH_P_ARP => try handleARP(iface, addr, pdu),
+        c.ETH_P_IP => try handleIP(iface, addr, pdu),
+        else => {},
     }
+}
 
-    s[17] = 0;
-    return s;
+pub fn replyEthernet(
+    iface: *TunDevice,
+    addr: DevAddress,
+    req_pdu: EthernetPDU,
+    buf: *SendBuf,
+) !void {
+    const ether_hdr = req_pdu.header;
+
+    var ether_buf = try buf.allocSlot(EthernetHeaderPtr.Size);
+    EthernetHeaderPtr.cast(ether_buf).set(.{
+        .dest_mac = ether_hdr.src_mac(),
+        .src_mac = addr.mac,
+        // Will answare in the same protocol as the request.
+        .ethertype = req_pdu.header.ethertype(),
+    });
+
+    try iface.writer().writeAll(buf.slice());
 }
