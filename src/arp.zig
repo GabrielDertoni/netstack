@@ -3,6 +3,8 @@ const c = @cImport({
 });
 
 const std = @import("std");
+const os = std.os;
+const event = std.event;
 const mem = std.mem;
 const assert = std.debug.assert;
 const print = std.debug.print;
@@ -10,7 +12,9 @@ const print = std.debug.print;
 const ethernet = @import("./ethernet.zig");
 const EthernetPDU = ethernet.EthernetPDU;
 const EthernetHeaderPtr = ethernet.EthernetHeaderPtr;
+const EthernetProtocol = ethernet.EthernetProtocol;
 const replyEthernet = ethernet.replyEthernet;
+const sendEthernet = ethernet.sendEthernet;
 
 const TunDevice = @import("./tuntap.zig").TunDevice;
 
@@ -192,12 +196,6 @@ pub const ArpIpv4Ptr = packed struct {
     }
 };
 
-// const ArpError = error{
-//     UnexpectedHardware,
-//     UnexpectedProtocol,
-//     FrameNotForUs,
-// };
-
 pub fn handleARP(iface: *TunDevice, addr: DevAddress, prev: EthernetPDU) !void {
     const data = prev.sdu;
     print("handling arp\n", .{});
@@ -232,6 +230,10 @@ pub fn handleARPIP(iface: *TunDevice, addr: DevAddress, prev: ArpPDU) !void {
 
     switch (prev.header.opcode()) {
         c.ARPOP_REQUEST => {
+            // Store the sender's MAC into the table since we know it's IP and everything.
+            arpInsert(arp_ipv4.sender_ip(), arp_ipv4.sender_mac());
+
+            // Respond.
             const pkt_size = EthernetHeaderPtr.Size + ArpHeaderPtr.header_size + ArpIpv4Ptr.data_size;
             // We know in advance that what the maximum size of the packet is
             // going to be. If for some reason, however, it happens
@@ -248,6 +250,21 @@ pub fn handleARPIP(iface: *TunDevice, addr: DevAddress, prev: ArpPDU) !void {
 
             return replyARP(iface, addr, prev, &send_buf);
         },
+        c.ARPOP_REPLY => {
+            print("Storing mac address for arp reply\n", .{});
+
+            // Got a reply, insert into the table
+            arpInsert(arp_ipv4.sender_ip(), arp_ipv4.sender_mac());
+
+            const entry = arp_requests.getEntryFor(.{ .req_ip = arp_ipv4.sender_ip() });
+
+            if (entry.node) |node| {
+                var bytes: [8]u8 = undefined;
+                mem.writeIntNative(u64, &bytes, 1);
+                // TODO: Should this really be a try???
+                _ = try os.write(node.key.eventfd, &bytes);
+            }
+        },
         else => {
             print("Not an arp request\n", .{});
             return;
@@ -259,11 +276,150 @@ pub fn replyARP(iface: *TunDevice, addr: DevAddress, req_pdu: ArpPDU, buf: *Send
     var slot = try buf.allocSlot(ArpHeaderPtr.header_size);
     ArpHeaderPtr.cast(slot).set(.{
         .hardware_type = c.ARPHRD_ETHER,
-        .protype = c.ETH_P_IP,
-        .hardware_addr_size = 6,
-        .prosize = 4,
+        .protype = req_pdu.header.protype(),
+        .hardware_addr_size = req_pdu.header.hardware_addr_size(),
+        .prosize = req_pdu.header.prosize(),
         .opcode = c.ARPOP_REPLY,
     });
 
     return replyEthernet(iface, addr, req_pdu.prev, buf);
+}
+
+const ARP_REQUEST_TIMEOUT_NS = 1 * std.time.ns_per_s;
+
+const RequestEntry = struct {
+    req_ip: u32,
+
+    // Defaults to -1 so that if something wrong happens, we will get invalid fd error.
+    eventfd: os.fd_t = -1,
+
+    // This allows for many nodes to be waiting on the same ip using the exact same eventfd. Only
+    // the root node is actually inserted in the `RequestQueue`.
+
+    // For some odd reason, using `RequestQueue.Node` won't work here because of a dependency loop.
+    // So this pointer is actually pointing to the `key` field inside a `RequestQueue.Node`.
+    prev: ?*RequestEntry = null,
+    next: ?*RequestEntry = null,
+};
+
+fn compareRequestEntry(a: RequestEntry, b: RequestEntry) std.math.Order {
+    return std.math.order(a.req_ip, b.req_ip);
+}
+
+const RequestQueue = std.Treap(RequestEntry, compareRequestEntry);
+
+// All arp requests that are waiting responses
+var arp_requests = RequestQueue{};
+
+pub fn requestARPIP(iface: *TunDevice, addr: DevAddress, ip: u32) !u48 {
+    if (arpLookup(ip)) |mac| return mac;
+
+    print("Fetching MAC with ARP\n", .{});
+
+    var local_node: RequestQueue.Node = undefined;
+
+    var entry = arp_requests.getEntryFor(.{ .req_ip = ip });
+    var eventfd: os.fd_t = undefined;
+
+    if (entry.node) |node| {
+        // There is already a request for this ip, join the wait.
+        eventfd = node.key.eventfd;
+        local_node.key = RequestEntry{ .req_ip = ip, .eventfd = eventfd, .prev = &node.key };
+        node.key.next = &local_node.key;
+    } else {
+        // Send the ARP request
+        try sendARPIPRequest(iface, addr, ip);
+
+        // Start waiting for the request
+        eventfd = try os.eventfd(0, os.linux.EFD.CLOEXEC);
+        entry.key.eventfd = eventfd;
+
+        // `node` is undefined here, but the `set` function will set it up. This parameter is
+        // really just providing a memory location to store the node.
+        entry.set(&local_node);
+    }
+
+    defer {
+        if (local_node.key.next) |next| next.prev = local_node.key.prev;
+        if (local_node.key.prev) |prev| {
+            prev.next = local_node.key.next;
+        } else if (local_node.key.next) |next| {
+            // This was the root node, the new root node will be the next one.
+            var new_entry = arp_requests.getEntryForExisting(&local_node);
+            // The key will change, but the `ip` value, which is used for the comparison, won't
+            // change. This means that the ordering for the treap won't be invalidated, so it's ok.
+            new_entry.key = next.*;
+            new_entry.set(@fieldParentPtr(RequestQueue.Node, "key", next));
+        } else {
+            var new_entry = arp_requests.getEntryForExisting(&local_node);
+            // Remove the entry.
+            new_entry.set(null);
+        }
+
+        if (local_node.key.next == null and local_node.key.prev == null) {
+            os.close(entry.key.eventfd);
+        }
+    }
+
+    try util.waitFdTimeout(eventfd, os.linux.EPOLL.IN, ARP_REQUEST_TIMEOUT_NS);
+    return arpLookup(ip) orelse return error.Timeout;
+}
+
+pub fn sendARPIPRequest(iface: *TunDevice, addr: DevAddress, ip: u32) !void {
+    const pkt_size = EthernetHeaderPtr.Size + ArpHeaderPtr.header_size + ArpIpv4Ptr.data_size;
+    // We know in advance that what the maximum size of the packet is
+    // going to be. If for some reason, however, it happens
+    var buf = std.heap.stackFallback(pkt_size, std.heap.c_allocator);
+    var send_buf = SendBuf.init(buf.get());
+
+    // Write arp IPv4 data
+    {
+        var slot = try send_buf.allocSlot(ArpIpv4Ptr.data_size);
+        ArpIpv4Ptr.cast(slot).set(.{
+            .sender_mac = addr.mac,
+            .sender_ip = addr.ip,
+            .destination_mac = 0xffffffffffff, // Broadcast
+            .destination_ip = ip,
+        });
+    }
+
+    // Write arp header
+    {
+        var slot = try send_buf.allocSlot(ArpHeaderPtr.header_size);
+        ArpHeaderPtr.cast(slot).set(.{
+            .hardware_type = c.ARPHRD_ETHER,
+            .protype = c.ETH_P_IP,
+            .hardware_addr_size = 6,
+            .prosize = 4,
+            .opcode = c.ARPOP_REQUEST,
+        });
+    }
+
+    return sendEthernet(
+        iface,
+        addr,
+        &send_buf,
+        .{ .dest_mac = 0xffffffffffff, .ethertype = EthernetProtocol.Arp },
+    );
+}
+
+// This is measured in bytes, not ideal, but should work
+const ARP_TABLE_MAX_ALLOC = 4096;
+
+var arp_table_buf = [_]u8{0} ** ARP_TABLE_MAX_ALLOC;
+var arp_table_alloc = std.heap.FixedBufferAllocator.init(&arp_table_buf);
+
+// The key is the IP address, the value is the MAC address
+var arp_table = std.AutoArrayHashMap(u32, u48).init(arp_table_alloc.allocator());
+
+fn arpInsert(ip: u32, mac: u48) void {
+    arp_table.put(ip, mac) catch {
+        _ = arp_table.pop();
+        // This should definetly work, unless we got a bug.
+        arp_table.put(ip, mac) catch unreachable;
+    };
+}
+
+fn arpLookup(ip: u32) ?u48 {
+    return arp_table.get(ip);
 }

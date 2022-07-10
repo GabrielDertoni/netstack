@@ -5,4 +5,6 @@
 // device name.
 int tun_alloc(char *dev_name);
 
+int tun_alloc_nonblock(char *dev_name);
+
 #endif

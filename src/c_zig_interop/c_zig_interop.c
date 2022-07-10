@@ -21,9 +21,9 @@ void _print_errno(const char* message, const char* fname, const char* fn_name, i
             strerror(errno), message, fname, fn_name, line);
 }
 
-int tun_alloc(char *dev_name) {
+int tun_alloc_with_flags(char *dev_name, int flags) {
     struct ifreq ifr;
-    int fd = open("/dev/net/tun", O_RDWR);
+    int fd = open("/dev/net/tun", flags);
     if (fd < 0) {
         print_errno("failed opening /dev/net/tun");
         return fd;
@@ -50,4 +50,12 @@ int tun_alloc(char *dev_name) {
 
     strcpy(dev_name, ifr.ifr_name);
     return fd;
+}
+
+int tun_alloc(char *dev_name) {
+    return tun_alloc_with_flags(dev_name, O_RDWR);
+}
+
+int tun_alloc_nonblock(char *dev_name) {
+    return tun_alloc_with_flags(dev_name, O_RDWR | O_NONBLOCK);
 }

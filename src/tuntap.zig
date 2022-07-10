@@ -7,6 +7,7 @@ const c = @cImport({
 const std = @import("std");
 const os = std.os;
 const io = std.io;
+const event = std.event;
 
 pub const TunDevice = struct {
     name: [c.IFNAMSIZ:0]u8,
@@ -21,7 +22,7 @@ pub const TunDevice = struct {
         @memset(&name, 0, c.IFNAMSIZ);
         @memcpy(&name, dev_name.ptr, @minimum(@intCast(usize, c.IFNAMSIZ), dev_name.len));
 
-        var fd = c.tun_alloc(&name);
+        var fd = if (io.mode == .evented) c.tun_alloc_nonblock(&name) else c.tun_alloc(&name);
         if (fd < 0) return error.FailedTunAlloc;
         return Self{ .name = name, .fd = fd };
     }
@@ -31,11 +32,21 @@ pub const TunDevice = struct {
     }
 
     pub fn read(self: *Self, buf: []u8) os.ReadError!usize {
-        return os.read(self.fd, buf);
+        if (io.mode == .evented) {
+            // Not simulating the event loop, we want the real thing!
+            return event.Loop.instance.?.read(self.fd, buf, false);
+        } else {
+            return os.read(self.fd, buf);
+        }
     }
 
     pub fn write(self: *Self, buf: []const u8) os.WriteError!usize {
-        return os.write(self.fd, buf);
+        if (io.mode == .evented) {
+            // Not simulating the event loop, we want the real thing!
+            return event.Loop.instance.?.write(self.fd, buf, false);
+        } else {
+            return os.write(self.fd, buf);
+        }
     }
 
     pub fn reader(self: *Self) Reader {

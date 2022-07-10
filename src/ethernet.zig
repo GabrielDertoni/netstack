@@ -119,13 +119,41 @@ pub fn replyEthernet(
     buf: *SendBuf,
 ) !void {
     const ether_hdr = req_pdu.header;
+    return sendEthernet(
+        iface,
+        addr,
+        buf,
+        .{
+            .dest_mac = ether_hdr.src_mac(),
+            .ethertype = req_pdu.header.ethertype(),
+        },
+    );
+}
+
+pub fn sendEthernet(
+    iface: *TunDevice,
+    addr: DevAddress,
+    buf: *SendBuf,
+    params: anytype,
+) !void {
+    comptime assert(blk: {
+        const T = @TypeOf(params);
+        break :blk @hasField(T, "dest_mac") and @hasField(T, "ethertype");
+    });
+    comptime assert(blk: {
+        const T = @TypeOf(params.ethertype);
+        break :blk T == EthernetProtocol or T == u16;
+    });
 
     var ether_buf = try buf.allocSlot(EthernetHeaderPtr.Size);
     EthernetHeaderPtr.cast(ether_buf).set(.{
-        .dest_mac = ether_hdr.src_mac(),
+        .dest_mac = params.dest_mac,
         .src_mac = addr.mac,
-        // Will answare in the same protocol as the request.
-        .ethertype = req_pdu.header.ethertype(),
+        .ethertype = switch (@TypeOf(params.ethertype)) {
+            u16 => params.ethertype,
+            EthernetProtocol => @enumToInt(params.ethertype),
+            else => unreachable,
+        },
     });
 
     try iface.writer().writeAll(buf.slice());
