@@ -198,7 +198,6 @@ pub const ArpIpv4Ptr = packed struct {
 
 pub fn handleARP(iface: *TunDevice, addr: DevAddress, prev: EthernetPDU) !void {
     const data = prev.sdu;
-    print("handling arp\n", .{});
     var arp_hdr = ArpHeaderPtr.cast(data);
 
     if (arp_hdr.hardware_type() != c.ARPHRD_ETHER) {
@@ -225,8 +224,7 @@ pub fn handleARPIP(iface: *TunDevice, addr: DevAddress, prev: ArpPDU) !void {
     var arp_ipv4 = ArpIpv4Ptr.cast(data);
 
     const dest_ip = arp_ipv4.destination_ip();
-    // TODO: Update translation table
-    if (addr.ip != dest_ip) return error.FrameNotForUs;
+    if (addr.ip != dest_ip) return;
 
     switch (prev.header.opcode()) {
         c.ARPOP_REQUEST => {
@@ -285,8 +283,6 @@ pub fn replyARP(iface: *TunDevice, addr: DevAddress, req_pdu: ArpPDU, buf: *Send
     return replyEthernet(iface, addr, req_pdu.prev, buf);
 }
 
-const ARP_REQUEST_TIMEOUT_NS = 1 * std.time.ns_per_s;
-
 const RequestEntry = struct {
     req_ip: u32,
 
@@ -311,8 +307,8 @@ const RequestQueue = std.Treap(RequestEntry, compareRequestEntry);
 // All arp requests that are waiting responses
 var arp_requests = RequestQueue{};
 
-pub fn requestARPIP(iface: *TunDevice, addr: DevAddress, ip: u32) !u48 {
-    if (arpLookup(ip)) |mac| return mac;
+pub fn requestARPIP(iface: *TunDevice, addr: DevAddress, ip: u32, timeout_ns: ?u64) !u48 {
+    if (arpTryLookup(ip)) |mac| return mac;
 
     print("Fetching MAC with ARP\n", .{});
 
@@ -361,8 +357,12 @@ pub fn requestARPIP(iface: *TunDevice, addr: DevAddress, ip: u32) !u48 {
         }
     }
 
-    try util.waitFdTimeout(eventfd, os.linux.EPOLL.IN, ARP_REQUEST_TIMEOUT_NS);
-    return arpLookup(ip) orelse return error.Timeout;
+    if (timeout_ns) |timeout| {
+        try util.waitFdTimeout(eventfd, os.linux.EPOLL.IN, timeout);
+    } else {
+        event.Loop.instance.?.waitUntilFdReadable(eventfd);
+    }
+    return arpTryLookup(ip) orelse return error.Timeout;
 }
 
 pub fn sendARPIPRequest(iface: *TunDevice, addr: DevAddress, ip: u32) !void {
@@ -420,6 +420,6 @@ fn arpInsert(ip: u32, mac: u48) void {
     };
 }
 
-fn arpLookup(ip: u32) ?u48 {
+pub fn arpTryLookup(ip: u32) ?u48 {
     return arp_table.get(ip);
 }

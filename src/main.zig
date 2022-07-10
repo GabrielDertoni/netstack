@@ -27,6 +27,7 @@ const assert = std.debug.assert;
 
 const ethernet = @import("./ethernet.zig");
 const arp = @import("./arp.zig");
+const icmp = @import("./icmp.zig");
 
 const TunDevice = @import("./tuntap.zig").TunDevice;
 
@@ -70,7 +71,10 @@ pub fn failiableHandleLoop(iface: *TunDevice, addr: DevAddress, wg: *event.WaitG
 
 pub fn handleLoop(iface: *TunDevice, addr: DevAddress, wg: *event.WaitGroup, shutdown: os.fd_t) void {
     failiableHandleLoop(iface, addr, wg, shutdown) catch |err| {
-        print("{e}\n", .{err});
+        std.log.err("{s}", .{@errorName(err)});
+        if (@errorReturnTrace()) |trace| {
+            std.debug.dumpStackTrace(trace.*);
+        }
     };
 }
 
@@ -132,6 +136,23 @@ fn asyncMain(iface: *TunDevice) !void {
         .mac = try util.parseMac(mac_str),
     };
 
+    var addr_to_ping: ?u32 = null;
+
+    var iter = std.process.args();
+    while (iter.next()) |arg| {
+        if (mem.eql(u8, arg, "--ping")) {
+            if (iter.next()) |ping_ip_str| {
+                addr_to_ping = try util.parseIp(ping_ip_str);
+            } else {
+                std.debug.print("expected an ip argument after --ping option\n", .{});
+                return;
+            }
+        }
+    }
+
+    try icmp.icmpInit();
+    defer icmp.icmpDeinit();
+
     const shutdown_fd = try os.eventfd(0, os.linux.EFD.CLOEXEC);
 
     var the_loop = std.event.Loop.instance.?;
@@ -153,10 +174,28 @@ fn asyncMain(iface: *TunDevice) !void {
         wg.wait();
     }
 
-    std.time.sleep(5 * std.time.ns_per_s);
+    if (addr_to_ping) |ip_to_ping| {
+        while (true) {
+            var timer = try std.time.Timer.start();
+            icmp.ping(iface, addr, ip_to_ping, null) catch |err| {
+                switch (err) {
+                    error.Timeout => print("Timed out\n", .{}),
+                    error.DestinationUnreachable => print("Destination unreachable\n", .{}),
+                    else => return err,
+                }
+                std.time.sleep(500 * std.time.ns_per_ms);
+                continue;
+            };
+            // try icmp.ping(iface, addr, try util.parseIp("10.0.0.1"), std.time.ns_per_s);
+            print("ping returned in {d}us\n", .{timer.read() / std.time.us_per_ms});
+            std.time.sleep(500 * std.time.ns_per_ms);
+        }
+    }
 
-    var mac = try arp.requestARPIP(iface, addr, try util.parseIp("10.0.0.1"));
+    wg.wait();
 
-    print("got mac: {s}\n", .{util.macAddrToStr(mac)});
+    // var mac = try arp.requestARPIP(iface, addr, try util.parseIp("10.0.0.1"), 1 * std.time.ns_per_s);
+
+    // print("got mac: {s}\n", .{util.macAddrToStr(mac)});
     print("Done\n", .{});
 }

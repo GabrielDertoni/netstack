@@ -6,9 +6,13 @@ const os = std.os;
 const print = std.debug.print;
 const assert = std.debug.assert;
 
+const arp = @import("./arp.zig");
+
 const ethernet = @import("./ethernet.zig");
 const EthernetPDU = ethernet.EthernetPDU;
 const replyEthernet = ethernet.replyEthernet;
+const sendEthernet = ethernet.sendEthernet;
+const EthernetProtocol = ethernet.EthernetProtocol;
 
 const icmp = @import("./icmp.zig");
 const handleICMP = icmp.handleICMP;
@@ -304,11 +308,9 @@ pub fn handleIP(iface: *TunDevice, addr: DevAddress, prev: EthernetPDU) !void {
     const proto = ip_hdr.getField(.proto);
     switch (proto) {
         os.IPPROTO.ICMP => {
-            print("ICMPV4 packet\n", .{});
             _ = try handleICMP(iface, addr, pdu);
         },
         os.IPPROTO.UDP => {
-            print("UDP packet\n", .{});
             _ = try handleUDP(iface, addr, pdu);
         },
         else => print("other ip protocol with code {d}\n", .{proto}),
@@ -339,6 +341,39 @@ pub fn replyIP(iface: *TunDevice, addr: DevAddress, req_pdu: IPv4PDU, buf: *Send
     ip_hdr_reply.compute_checksum();
 
     try replyEthernet(iface, addr, req_pdu.prev, buf);
+}
+
+pub fn sendIP(iface: *TunDevice, addr: DevAddress, ip: u32, buf: *SendBuf) !void {
+    var slot = try buf.allocSlot(IpHeaderPtr.size);
+    var ip_hdr = IpHeaderPtr.cast(slot);
+    ip_hdr.set(.{
+        .version = 4,
+        .ihl = 5,
+        .tos = c.IPTOS_ECN_NOT_ECT,
+        .len = @truncate(u16, buf.len),
+        .flags = 0b010,
+        .frag_offset = 0,
+        .ttl = 64,
+        .proto = os.IPPROTO.ICMP,
+        .header_checksum = 0,
+        .sender_addr = addr.ip,
+        .dest_addr = ip,
+    });
+    ip_hdr.compute_checksum();
+
+    var dest_mac: u48 = undefined;
+
+    // TODO: This should not be hard coded.
+    const mask = 0xffffff00;
+    // If the target ip is not in the same network as us, use the MAC of the default gateway.
+    if ((ip & mask) != (addr.ip & mask)) {
+        const default_gateway: u32 = 0x0a000001; // 10.0.0.1
+        dest_mac = arp.arpTryLookup(default_gateway) orelse return error.NoMac;
+    } else {
+        dest_mac = arp.arpTryLookup(ip) orelse return error.NoMac;
+    }
+
+    try sendEthernet(iface, addr, buf, .{ .dest_mac = dest_mac, .ethertype = EthernetProtocol.Ip });
 }
 
 test "Internet Check Sum" {
